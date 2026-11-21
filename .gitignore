@@ -1,0 +1,12 @@
+# Never commit the fetched formalization or build artifacts.
+lean/
+lean.tar.gz
+lean.tar.gz.part*
+.lake/
+chain-status/
+kaggle-upload/
+kaggle-download/
+*.olean
+*.ilean
+__pycache__/
+.elan/

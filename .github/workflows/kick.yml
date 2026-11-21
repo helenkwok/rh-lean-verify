@@ -1,0 +1,47 @@
+name: Chain Kick
+
+# GitHub will not start a new workflow from GITHUB_TOKEN events, so this
+# sibling workflow is the no-PAT way to chain jobs. It succeeds only when
+# the previous Verify RH Lean run asked to continue; that success is what
+# retriggers Verify RH Lean. A failure here is expected when the chain
+# should stop, and is not a build failure.
+on:
+  workflow_run:
+    workflows: ["Verify RH Lean"]
+    types:
+      - completed
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  kick:
+    name: Continue the chain if needed
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    steps:
+      - name: Download chain-status from the verify run
+        uses: actions/download-artifact@v4
+        with:
+          name: chain-status
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Decide whether to kick the next build
+        run: |
+          if [[ ! -f status.json ]]; then
+            echo "No status.json artifact; stopping the chain."
+            exit 1
+          fi
+          cat status.json
+          python3 -c 'import json, pathlib, sys
+          data = json.loads(pathlib.Path("status.json").read_text())
+          print("continue =", data.get("continue"), "reason =", data.get("reason"))
+          if data.get("continue") is True:
+              print("Kicking the next Verify RH Lean job.")
+              sys.exit(0)
+          print("Stopping the chain (this failure is expected).")
+          sys.exit(1)
+          '

@@ -1,0 +1,263 @@
+name: Verify RH Lean
+
+on:
+  workflow_dispatch:
+    inputs:
+      smoke:
+        description: "Short smoke test (fetch, Mathlib cache, ~12 min build). Does not chain."
+        type: boolean
+        default: false
+  workflow_run:
+    workflows: ["Chain Kick"]
+    types:
+      - completed
+
+concurrency:
+  group: rh-lean-verify
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  build:
+    name: Fetch, build, cache
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      TARBALL_SHA256: 9631b4f020199e580ba86178cb56c6e9b09f690c2369a80dc4334aa93f49c7fc
+      TARBALL_BASE: https://alpo.ge/lean.tar.gz
+      TARBALL_PARTS: "14"
+      KAGGLE_DATASET_SLUG: rh-lean-olean-cache
+      WORKDIR: ${{ github.workspace }}
+      # Populated from repo secrets when present. Missing is OK for a smoke test.
+      KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+      KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+
+    steps:
+      - name: Checkout workflow repo
+        uses: actions/checkout@v4
+
+      - name: Record run mode
+        id: mode
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.smoke }}" == "true" ]]; then
+            echo "smoke=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "smoke=false" >> "$GITHUB_OUTPUT"
+          fi
+          df -h /
+
+      - name: Free runner disk
+        run: bash scripts/free-disk.sh
+
+      - name: Install elan, zstd, kaggle CLI
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends zstd unzip python3-pip ripgrep
+          pip install --user -U kaggle
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \
+            | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      - name: Fetch and verify upstream tarball
+        run: bash scripts/fetch-source.sh "$WORKDIR"
+
+      - name: Install AxiomCheck.lean
+        run: |
+          cp src/AxiomCheck.lean lean/src/AxiomCheck.lean
+          echo "Toolchain: $(cat lean/lean-toolchain)"
+          echo "lakefile:"
+          cat lean/lakefile.toml
+
+      - name: Scan sources for sorry, axiom, native_decide, unsafe
+        run: |
+          bash scripts/scan-shortcuts.sh lean/src shortcut-scan.txt
+          if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+            {
+              echo "## Shortcut scan (project sources only)"
+              echo
+              echo '```'
+              cat shortcut-scan.txt.summary
+              echo '```'
+              echo
+              if [[ -s shortcut-scan.txt ]]; then
+                echo "<details><summary>First 80 matching lines</summary>"
+                echo
+                echo '```'
+                head -80 shortcut-scan.txt
+                echo '```'
+                echo
+                echo "</details>"
+              fi
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Get Mathlib oleans
+        working-directory: lean
+        run: |
+          # lean-toolchain pins leanprover/lean4:v4.33.1; Mathlib rev is in lakefile.toml
+          lake --version
+          lake exe cache get
+
+      - name: Restore olean cache from Kaggle
+        id: restore
+        run: |
+          if [[ -z "${KAGGLE_USERNAME:-}" || -z "${KAGGLE_KEY:-}" ]]; then
+            echo "No Kaggle secrets in this repository yet; starting without a cache."
+            echo "restored=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if bash scripts/kaggle_cache.sh download; then
+            if bash scripts/pack-oleans.sh unpack "$WORKDIR/kaggle-download"; then
+              echo "restored=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          echo "restored=false" >> "$GITHUB_OUTPUT"
+
+      - name: Drop regenerable IR to save disk
+        run: |
+          # Lean writes large per-module setup.json files under .lake/build/ir
+          # (several MB each). They are not required to resume from oleans.
+          # Sweep anything older than a few minutes so in-flight compiles are left alone.
+          mkdir -p lean/.lake/build/ir
+          nohup bash -c '
+            while sleep 180; do
+              find lean/.lake/build/ir \( -name "*.setup.json" -o -name "*.c" -o -name "*.c.hash" \) -mmin +5 -delete 2>/dev/null || true
+              find lean/.lake/build/lib -name "*.ilean" -mmin +5 -delete 2>/dev/null || true
+              find lean/.lake/build/lib -name "*.trace" -mmin +5 -delete 2>/dev/null || true
+              df -h / | tail -1
+            done
+          ' >/tmp/ir-sweep.log 2>&1 &
+          echo $! > /tmp/ir-sweep.pid
+
+      - name: lake build Main
+        id: lake
+        working-directory: lean
+        run: |
+          if [[ "${{ steps.mode.outputs.smoke }}" == "true" ]]; then
+            BUILD_SECS=720
+            echo "Smoke mode: timing out lake after ${BUILD_SECS}s"
+          else
+            # 5 hours, leaving ~1 hour in the 6-hour job cap for pack + upload.
+            BUILD_SECS=18000
+          fi
+          set +e
+          timeout --signal=INT --kill-after=10m "${BUILD_SECS}s" lake build Main
+          code=$?
+          set -e
+          # 124 = timeout sent SIGINT; 137 = later SIGKILL. Both mean "paused".
+          echo "lake_exit=$code" >> "$GITHUB_OUTPUT"
+          echo "lake build exited with $code"
+          if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+            echo "- \`lake build Main\` exit code: $code (124/137 means the time cap was hit)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Count oleans and maybe print axioms
+        id: after
+        run: |
+          oleans=$(find lean/.lake/build/lib -name '*.olean' 2>/dev/null | wc -l | tr -d ' ')
+          echo "oleans=$oleans" >> "$GITHUB_OUTPUT"
+          echo "Project oleans on disk: $oleans"
+          df -h /
+          if [[ "${{ steps.lake.outputs.lake_exit }}" == "0" ]]; then
+            set +e
+            (cd lean && lake env lean src/AxiomCheck.lean) | tee axiom-output.txt
+            echo "AXIOM_OUTPUT<<MARK" >> "$GITHUB_ENV"
+            cat axiom-output.txt >> "$GITHUB_ENV"
+            echo "MARK" >> "$GITHUB_ENV"
+            set -e
+          fi
+
+      - name: Stop IR sweeper and pack oleans
+        if: always()
+        run: |
+          if [[ -f /tmp/ir-sweep.pid ]]; then kill "$(cat /tmp/ir-sweep.pid)" 2>/dev/null || true; fi
+          export OLEAN_COUNT="${{ steps.after.outputs.oleans }}"
+          bash scripts/pack-oleans.sh pack
+
+      - name: Upload olean cache to Kaggle
+        id: save
+        if: always()
+        run: |
+          if [[ -z "${KAGGLE_USERNAME:-}" || -z "${KAGGLE_KEY:-}" ]]; then
+            echo "Kaggle secrets are not set; cannot persist the olean cache."
+            echo "saved=false" >> "$GITHUB_OUTPUT"
+            echo "backend=none" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          export KAGGLE_VERSION_MESSAGE="run ${GITHUB_RUN_ID} oleans=${{ steps.after.outputs.oleans }} lake_exit=${{ steps.lake.outputs.lake_exit }}"
+          if bash scripts/kaggle_cache.sh upload; then
+            echo "saved=true" >> "$GITHUB_OUTPUT"
+            echo "backend=kaggle" >> "$GITHUB_OUTPUT"
+          else
+            echo "saved=false" >> "$GITHUB_OUTPUT"
+            echo "backend=none" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Write chain status
+        if: always()
+        run: |
+          export SMOKE="${{ steps.mode.outputs.smoke }}"
+          export LAKE_EXIT="${{ steps.lake.outputs.lake_exit }}"
+          export OLEAN_COUNT="${{ steps.after.outputs.oleans }}"
+          export CACHE_SAVED="${{ steps.save.outputs.saved }}"
+          export CACHE_BACKEND="${{ steps.save.outputs.backend }}"
+          # Continue only when the build is unfinished, this was not a smoke
+          # test, and a cache was actually saved (otherwise the next job
+          # would start from scratch).
+          if [[ "$SMOKE" != "true" && "$LAKE_EXIT" != "0" && "$CACHE_SAVED" == "true" ]]; then
+            if [[ "$LAKE_EXIT" == "124" || "$LAKE_EXIT" == "137" ]]; then
+              export CHAIN_CONTINUE=true
+              export CHAIN_REASON="Build timed out after the slot; a Kaggle cache was saved, so the next job can resume."
+            else
+              export CHAIN_CONTINUE=false
+              export CHAIN_REASON="lake build Main failed with exit $LAKE_EXIT; not chaining."
+            fi
+          elif [[ "$LAKE_EXIT" == "0" ]]; then
+            export CHAIN_CONTINUE=false
+            export CHAIN_REASON="lake build Main finished. See #print axioms in this summary."
+          elif [[ "$SMOKE" == "true" ]]; then
+            export CHAIN_CONTINUE=false
+            export CHAIN_REASON="Smoke test only; not chaining. Re-run the workflow with smoke unchecked once Kaggle secrets are set."
+          else
+            export CHAIN_CONTINUE=false
+            export CHAIN_REASON="Build did not finish and no Kaggle cache was saved. Add KAGGLE_USERNAME and KAGGLE_KEY, then re-run."
+          fi
+          bash scripts/write-status.sh
+
+      - name: Upload chain-status artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chain-status
+          path: chain-status/status.json
+          retention-days: 14
+
+      - name: Fail the job if a full build could not be persisted
+        if: always()
+        run: |
+          lake_exit="${{ steps.lake.outputs.lake_exit }}"
+          smoke="${{ steps.mode.outputs.smoke }}"
+          saved="${{ steps.save.outputs.saved }}"
+          if [[ "$smoke" == "true" ]]; then
+            echo "Smoke test complete."
+            exit 0
+          fi
+          if [[ "$lake_exit" == "0" ]]; then
+            exit 0
+          fi
+          if [[ "$lake_exit" == "124" || "$lake_exit" == "137" ]]; then
+            if [[ "$saved" == "true" ]]; then
+              echo "Slot timed out; cache saved. The kick workflow will start the next job."
+              exit 0
+            fi
+            echo "::error::Slot timed out but the olean cache was not saved. Add Kaggle secrets and re-run."
+            exit 1
+          fi
+          echo "::error::lake build Main failed with exit $lake_exit"
+          exit 1
